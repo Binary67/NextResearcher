@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
-# === Configure this (same target repo as Main.py) ===
-TARGET_REPO = "CHANGE_ME"
-
 PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_ROOT / "CodexConfig.toml"
+
+config = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+TARGET_REPO = config["Experiment"]["target_repo"]
 
 
 def reset_experiments(target_repo: str | Path | None = None):
@@ -32,7 +34,7 @@ def reset_experiments(target_repo: str | Path | None = None):
     else:
         print("No logs to clear.")
 
-    if target_repo and target_repo != "CHANGE_ME":
+    if target_repo:
         target = Path(target_repo).resolve()
         subprocess.run(
             ["git", "-C", str(target), "worktree", "prune", "--verbose"],
