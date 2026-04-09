@@ -35,6 +35,7 @@ class CodexSessionLog:
         self._logs_root = Path(logs_root) if logs_root is not None else self._default_logs_root()
         self._logs_root.mkdir(parents=True, exist_ok=True)
         self._thread_paths: dict[str, Path] = {}
+        self._written_paths: set[Path] = set()
 
     @property
     def logs_root(self) -> Path:
@@ -55,8 +56,8 @@ class CodexSessionLog:
         return self._append_sections(
             self.path_for_thread(thread_id),
             [
-                self._single_line_section("Session Started", self._describe_session(cwd)),
-                self._single_line_section("Thread Id", thread_id),
+                ("Session Started", self._describe_session(cwd)),
+                ("Thread Id", thread_id),
             ],
         )
 
@@ -78,11 +79,11 @@ class CodexSessionLog:
             status_line = f"{status_line}; exit_code={command.exit_code}"
 
         sections = [
-            self._single_line_section("Commands Run", command.command),
-            self._single_line_section("Command Status", status_line),
+            ("Commands Run", command.command),
+            ("Command Status", status_line),
         ]
         if command.duration_ms is not None:
-            sections.append(self._single_line_section("Command Duration Ms", str(command.duration_ms)))
+            sections.append(("Command Duration Ms", str(command.duration_ms)))
         command_failed = (
             command.status in {"failed", "declined"}
             or (command.exit_code is not None and command.exit_code != 0)
@@ -95,25 +96,27 @@ class CodexSessionLog:
     def append_turn_finished(self, thread_id: str, turn: TurnLogEntry, status: str) -> Path:
         work_summary = f"Ran {len(turn.commands)} command(s)."
         sections: list[tuple[str, str]] = [
-            self._single_line_section("Turn Status", status),
-            self._single_line_section("Work Performed", work_summary),
+            ("Turn Status", status),
+            ("Work Performed", work_summary),
         ]
 
         if not turn.commands:
-            sections.append(self._single_line_section("Commands Run", "None"))
+            sections.append(("Commands Run", "None"))
 
         if turn.errors_and_recoveries:
             errors_text = "\n".join(f"- {entry}" for entry in turn.errors_and_recoveries)
             sections.append(self._multi_line_section("Errors And Recoveries", errors_text))
         else:
-            sections.append(self._single_line_section("Errors And Recoveries", "None"))
+            sections.append(("Errors And Recoveries", "None"))
 
         return self._append_sections(self.path_for_thread(thread_id), sections)
 
     def _append_sections(self, path: Path, sections: list[tuple[str, str]]) -> Path:
         with path.open("a", encoding="utf-8") as handle:
-            if path.exists() and path.stat().st_size > 0:
+            if path in self._written_paths:
                 handle.write("\n")
+            else:
+                self._written_paths.add(path)
             for title, content in sections:
                 if "\n" in content:
                     handle.write(f"[{title}]:\n{content.rstrip()}\n")
@@ -124,9 +127,6 @@ class CodexSessionLog:
     def _describe_session(self, cwd: str | None) -> str:
         timestamp = datetime.now(timezone.utc).isoformat()
         return f"{timestamp}; cwd={cwd or '(unknown)'}"
-
-    def _single_line_section(self, title: str, content: str) -> tuple[str, str]:
-        return title, content
 
     def _multi_line_section(self, title: str, content: str) -> tuple[str, str]:
         normalized = content.strip() or "(empty)"

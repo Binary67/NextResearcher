@@ -276,7 +276,7 @@ class CodexAgent:
         turn_result = self._request(
             "turn/start",
             {
-                "threadId": self._require_thread_id(),
+                "threadId": self._thread_id,
                 "input": [{"type": "text", "text": instruction}],
             },
         )
@@ -318,15 +318,6 @@ class CodexAgent:
         thread_id = self._require_thread_id()
         self._session_log.append_turn_started(thread_id, instruction)
 
-        def build_turn_result(response_text: str) -> CodexTurnResult:
-            turn_entry = collector.to_entry(response_text)
-            return CodexTurnResult(
-                response_text=turn_entry.codex_response,
-                commands=turn_entry.commands,
-                file_changes=turn_entry.file_changes,
-                errors_and_recoveries=turn_entry.errors_and_recoveries,
-            )
-
         def append_response_snapshot(response_text: str) -> None:
             nonlocal last_logged_response
             if not response_text:
@@ -344,30 +335,23 @@ class CodexAgent:
             nonlocal did_finish_log
             if error_message:
                 collector.note_error(error_message)
-            result = build_turn_result(response_text)
-            if did_finish_log:
-                return result
-            append_response_snapshot(result.response_text or "(no final response)")
-            self._session_log.append_turn_finished(
-                thread_id,
-                TurnLogEntry(
-                    user_request=instruction,
-                    codex_response=result.response_text,
-                    commands=result.commands,
-                    file_changes=result.file_changes,
-                    errors_and_recoveries=result.errors_and_recoveries,
-                ),
-                status,
+            turn_entry = collector.to_entry(response_text)
+            if not did_finish_log:
+                append_response_snapshot(turn_entry.codex_response or "(no final response)")
+                self._session_log.append_turn_finished(thread_id, turn_entry, status)
+                did_finish_log = True
+            return CodexTurnResult(
+                response_text=turn_entry.codex_response,
+                commands=turn_entry.commands,
+                file_changes=turn_entry.file_changes,
+                errors_and_recoveries=turn_entry.errors_and_recoveries,
             )
-            did_finish_log = True
-            return result
 
         try:
             while True:
                 message = self._read_message()
                 if self._handle_server_request(message):
                     continue
-                self._raise_for_server_request(message)
 
                 if "id" in message:
                     raise CodexAgentError(f"Unexpected JSON-RPC response while waiting for turn events: {message!r}")
@@ -475,7 +459,7 @@ class CodexAgent:
 
         while True:
             message = self._read_message()
-            self._raise_for_server_request(message)
+            self._handle_server_request(message)
 
             if message.get("id") != request_id:
                 deferred_messages.append(message)
@@ -550,12 +534,6 @@ class CodexAgent:
             raise ValueError(f"cwd is not a directory: {cwd}")
         return str(candidate.resolve())
 
-    def _raise_for_server_request(self, message: dict[str, Any]) -> None:
-        if "method" in message and "id" in message and "result" not in message and "error" not in message:
-            raise self.build_error(
-                f"Codex requested client-side handling for {message['method']}, which this wrapper does not support."
-            )
-
     def _handle_server_request(self, message: dict[str, Any]) -> bool:
         if "method" not in message or "id" not in message or "result" in message or "error" in message:
             return False
@@ -572,7 +550,9 @@ class CodexAgent:
             self._write_message({"id": message["id"], "result": {"permissions": permissions, "scope": "turn"}})
             return True
 
-        return False
+        raise self.build_error(
+            f"Codex requested client-side handling for {method}, which this wrapper does not support."
+        )
 
     def _require_process(self) -> subprocess.Popen[str]:
         if self._process is None:
@@ -590,8 +570,7 @@ class CodexAgent:
         return self._thread_id
 
     def _extract_delta_text(self, params: dict[str, Any]) -> str:
-        preferred_keys = ("delta", "output", "text")
-        for key in preferred_keys:
+        for key in ("delta", "output", "text"):
             value = params.get(key)
             if isinstance(value, str) and value:
                 return value
@@ -602,13 +581,4 @@ class CodexAgent:
         if isinstance(content, (dict, list)):
             return json.dumps(content, ensure_ascii=False, indent=2)
 
-        values: list[str] = []
-        for key, value in params.items():
-            if key in {"itemId", "threadId", "turnId"}:
-                continue
-            if isinstance(value, str) and value:
-                values.append(value)
-            elif isinstance(value, (dict, list)):
-                values.append(json.dumps(value, ensure_ascii=False, indent=2))
-
-        return "\n".join(values).strip()
+        return ""

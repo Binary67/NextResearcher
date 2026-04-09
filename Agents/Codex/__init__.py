@@ -1,10 +1,10 @@
 from .Agent import CodexAgent, CodexAgentError, CodexTurnResult
-from .SessionRunner import CodexSessionRunResult, CodexSessionRunner
+from .SessionRunner import CodexSessionRunResult, run_codex_session
 
 __all__ = [
     "CodexAgent",
     "CodexAgentError",
     "CodexTurnResult",
     "CodexSessionRunResult",
-    "CodexSessionRunner",
+    "run_codex_session",
 ]

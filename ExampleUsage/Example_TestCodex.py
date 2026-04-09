@@ -1,13 +1,12 @@
 from pathlib import Path
 
-from Agents.Codex import CodexSessionRunner
+from Agents.Codex import run_codex_session
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
-    runner = CodexSessionRunner()
-    result = runner.run(
+    result = run_codex_session(
         cwd=PROJECT_ROOT,
         instruction=(
             "Create a file called hello_world.py in the current directory. "
