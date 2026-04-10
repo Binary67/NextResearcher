@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import re
+import json
 import shutil
 import subprocess
 import time
@@ -11,6 +11,8 @@ from typing import Any
 from Agents.Codex import run_codex_session
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+BEST_BRANCH = "best/current"
+BEST_STATE_PATH = PROJECT_ROOT / "BestState.json"
 
 HIDDEN_EVAL_TOOL = {
     "name": "run_hidden_eval",
@@ -46,26 +48,31 @@ def run_experiment_loop(
     worktree_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    prev_best_commit, prev_best_score = _get_best_branch_info(target_repo)
-    if prev_best_commit:
-        base_commit = prev_best_commit
-        print(f"Resuming from previous best: {base_commit} (score: {prev_best_score})")
-    else:
-        base_commit = subprocess.run(
-            ["git", "-C", str(target_repo), "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        print(f"Starting from HEAD: {base_commit}")
+    try:
+        current_best_commit, current_best_score = _load_best_state(target_repo, eval_strategy)
+    except RuntimeError as exc:
+        print(exc)
+        return []
 
+    if current_best_commit:
+        print(f"Resuming from {BEST_BRANCH}: {current_best_commit} (score: {current_best_score})")
+    else:
+        current_best_commit = _get_head_commit(target_repo)
+        print(f"Starting from HEAD: {current_best_commit}")
+
+    initial_commit = current_best_commit
     experiment_log = logs_dir / f"experiment_{datetime.now():%Y%m%d_%H%M%S}.md"
-    _write_header(experiment_log, target_repo, base_commit, eval_command, num_iterations, eval_strategy)
+    _write_header(experiment_log, target_repo, initial_commit, eval_command, num_iterations, eval_strategy)
 
     results = []
+    fatal_error = ""
+
     for i in range(1, num_iterations + 1):
         print(f"\n{'=' * 60}")
         print(f"  Iteration {i} / {num_iterations}")
         print(f"{'=' * 60}")
 
+        base_commit = current_best_commit
         agent_worktree = worktree_dir / f"iteration_{i:03d}_agent"
         eval_worktree = worktree_dir / f"iteration_{i:03d}_eval"
 
@@ -74,7 +81,13 @@ def run_experiment_loop(
             _create_worktree(target_repo, eval_worktree, base_commit)
         except subprocess.CalledProcessError as exc:
             print(f"Worktree creation failed: {exc}")
-            result = _make_result(i, agent_worktree, status="worktree_error", error=str(exc))
+            result = _make_result(
+                i,
+                agent_worktree,
+                base_commit=base_commit,
+                status="worktree_error",
+                error=str(exc),
+            )
             results.append(result)
             _append_iteration(experiment_log, result)
             continue
@@ -149,7 +162,7 @@ def run_experiment_loop(
             else:
                 comparison_line = "Comparison: No baseline available"
 
-            if bl is not None and (parsed > bl if maximize else parsed < bl):
+            if bl is not None and _is_better(parsed, bl, maximize):
                 recommendation = "Your changes improved the score. You may stop here."
             else:
                 recommendation = "Your changes did not improve the score. Analyze why and try a different approach."
@@ -202,11 +215,14 @@ def run_experiment_loop(
         if trials:
             best_trial = (max if maximize else min)(trials, key=lambda t: t["score"])
 
+        promotion_error = ""
         best_score_str = str(best_trial["score"]) if best_trial else ""
         status = "codex_error" if codex_failed else "completed"
 
         result = _make_result(
-            i, agent_worktree,
+            i,
+            agent_worktree,
+            base_commit=base_commit,
             session_log=str(session_log) if session_log else None,
             codex_response=codex_response,
             eval_score=best_score_str,
@@ -214,6 +230,7 @@ def run_experiment_loop(
             status=status,
             error="" if not codex_failed else codex_response,
             trials=trials,
+            promoted_to_best=False,
         )
 
         if best_trial:
@@ -221,63 +238,72 @@ def run_experiment_loop(
             result["parsed_score"] = best_trial["score"]
             try:
                 subprocess.run(
-                    ["git", "-C", str(target_repo), "branch",
-                     f"experiment/iter_{i:03d}", best_trial["commit"]],
-                    capture_output=True, text=True, check=True,
+                    ["git", "-C", str(target_repo), "branch", "-f", f"experiment/iter_{i:03d}", best_trial["commit"]],
+                    capture_output=True,
+                    text=True,
+                    check=True,
                 )
                 print(f"Saved best trial to branch: experiment/iter_{i:03d} (score: {best_trial['score']})")
             except Exception as exc:
                 print(f"Warning: failed to save branch for iteration {i}: {exc}")
 
+            should_promote = current_best_score is None or _is_better(best_trial["score"], current_best_score, maximize)
+            if should_promote:
+                try:
+                    _promote_best_state(target_repo, best_trial["commit"], best_trial["score"], eval_strategy)
+                    current_best_commit = best_trial["commit"]
+                    current_best_score = best_trial["score"]
+                    result["promoted_to_best"] = True
+                    print(f"Updated {BEST_BRANCH}: {current_best_commit} (score: {current_best_score})")
+                except Exception as exc:
+                    promotion_error = f"Failed to update best state: {exc}"
+                    result["status"] = "best_state_error"
+                    result["error"] = promotion_error
+                    print(promotion_error)
+
         results.append(result)
         _append_iteration(experiment_log, result)
+
+        if promotion_error:
+            fatal_error = promotion_error
+            break
+
+    _delete_branches(target_repo, "experiment/iter_*")
 
     completed_results = [r for r in results if r.get("parsed_score") is not None]
     best_result = None
 
     if completed_results:
         best_result = (max if maximize else min)(completed_results, key=lambda r: r["parsed_score"])
-        new_best_score = best_result["parsed_score"]
-        new_best_iter = best_result["iteration"]
-        new_best_commit = best_result.get("commit_hash", "")
+    elif not fatal_error:
+        print("No successful iterations. Keeping existing best state (if any).")
 
-        should_update = prev_best_score is None or (
-            new_best_score > prev_best_score if maximize else new_best_score < prev_best_score
-        )
+    _append_summary(experiment_log, results, best_result, fatal_error=fatal_error)
 
-        if should_update and new_best_commit:
-            _delete_branches(target_repo, "best/*")
-            subprocess.run(
-                ["git", "-C", str(target_repo), "branch",
-                 f"best/iter_{new_best_iter:03d}", new_best_commit],
-                capture_output=True, text=True, check=True,
-            )
-            print(f"Best branch: best/iter_{new_best_iter:03d} (score: {new_best_score})")
-        elif not should_update:
-            print(f"No improvement over previous best ({prev_best_score}). Keeping existing best branch.")
-
-        _delete_branches(target_repo, "experiment/iter_*")
+    if fatal_error:
+        print(f"\nExperiment stopped early. Log: {experiment_log}")
     else:
-        print("No successful iterations. Keeping existing best branch (if any).")
-
-    _append_summary(experiment_log, results, best_result)
-    print(f"\nExperiment complete. Log: {experiment_log}")
+        print(f"\nExperiment complete. Log: {experiment_log}")
     return results
 
 
 def _snapshot_worktree(worktree_path: Path, trial_number: int) -> str:
     subprocess.run(
         ["git", "-C", str(worktree_path), "add", "-A"],
-        capture_output=True, check=True,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
-        ["git", "-C", str(worktree_path), "commit", "--allow-empty", "-m",
-         f"Trial {trial_number} snapshot"],
-        capture_output=True, text=True, check=True,
+        ["git", "-C", str(worktree_path), "commit", "--allow-empty", "-m", f"Trial {trial_number} snapshot"],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return subprocess.run(
         ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
 
@@ -285,12 +311,14 @@ def _make_result(iteration, worktree_path, **kwargs):
     return {
         "iteration": iteration,
         "worktree": str(worktree_path),
+        "base_commit": "",
         "session_log": None,
         "codex_response": "",
         "eval_score": "",
         "codex_duration_s": 0,
         "status": "completed",
         "error": "",
+        "promoted_to_best": False,
         **kwargs,
     }
 
@@ -305,40 +333,183 @@ def _parse_score(eval_score_str: str) -> float | None:
         return None
 
 
-
-def _get_best_branch_info(target_repo: Path) -> tuple[str, float | None]:
-    output = subprocess.run(
-        ["git", "-C", str(target_repo), "branch", "--list", "best/*"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    if not output:
-        return ("", None)
-    branch_name = output.splitlines()[0].strip().removeprefix("* ")
-    commit_hash = subprocess.run(
-        ["git", "-C", str(target_repo), "log", "-1", "--format=%H", branch_name],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    message = subprocess.run(
-        ["git", "-C", str(target_repo), "log", "-1", "--format=%s", branch_name],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    match = re.search(r"score:\s*([-\d.eE+]+)", message)
-    score = float(match.group(1)) if match else None
-    return (commit_hash, score)
+def _is_better(candidate: float, baseline: float, maximize: bool) -> bool:
+    return candidate > baseline if maximize else candidate < baseline
 
 
-def _delete_branches(target_repo: Path, pattern: str):
-    output = subprocess.run(
-        ["git", "-C", str(target_repo), "branch", "--list", pattern],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    for line in output.splitlines():
-        name = line.strip().removeprefix("* ")
-        if name:
-            subprocess.run(
-                ["git", "-C", str(target_repo), "branch", "-D", name],
-                capture_output=True,
+def _load_best_state(target_repo: Path, eval_strategy: str) -> tuple[str, float | None]:
+    best_branches = _list_branches(target_repo, "best/*")
+    has_best_branch = BEST_BRANCH in best_branches
+    stray_best_branches = [branch for branch in best_branches if branch != BEST_BRANCH]
+    has_best_state_file = BEST_STATE_PATH.exists()
+
+    if not has_best_branch and not has_best_state_file:
+        if stray_best_branches:
+            branch_list = ", ".join(stray_best_branches)
+            raise RuntimeError(
+                f"Legacy best branch state detected ({branch_list}). "
+                "Run ResetExperiments.py first."
             )
+        return ("", None)
+
+    if has_best_branch != has_best_state_file:
+        raise RuntimeError(
+            f"Invalid best state for {target_repo}: {BEST_BRANCH} and {BEST_STATE_PATH.name} "
+            "must both exist or both be absent. Run ResetExperiments.py first."
+        )
+
+    best_commit = _resolve_branch_commit(target_repo, BEST_BRANCH)
+    if not best_commit:
+        raise RuntimeError(
+            f"Invalid best state for {target_repo}: could not resolve {BEST_BRANCH}. "
+            "Run ResetExperiments.py first."
+        )
+
+    try:
+        raw_state = json.loads(BEST_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: {exc}. "
+            "Run ResetExperiments.py first."
+        ) from exc
+
+    if not isinstance(raw_state, dict):
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: expected an object. "
+            "Run ResetExperiments.py first."
+        )
+
+    state_repo = raw_state.get("target_repo")
+    state_branch = raw_state.get("best_branch")
+    state_commit = raw_state.get("best_commit")
+    state_score = raw_state.get("best_score")
+    state_strategy = raw_state.get("eval_strategy")
+    updated_at = raw_state.get("updated_at")
+
+    if state_repo != str(target_repo):
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: target_repo does not match {target_repo}. "
+            "Run ResetExperiments.py first."
+        )
+    if state_branch != BEST_BRANCH:
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: best_branch must be {BEST_BRANCH}. "
+            "Run ResetExperiments.py first."
+        )
+    if state_strategy != eval_strategy:
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: eval_strategy does not match {eval_strategy}. "
+            "Run ResetExperiments.py first."
+        )
+    if not isinstance(state_commit, str) or not state_commit:
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: best_commit is missing. "
+            "Run ResetExperiments.py first."
+        )
+    if state_commit != best_commit:
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: best_commit does not match {BEST_BRANCH}. "
+            "Run ResetExperiments.py first."
+        )
+    if not isinstance(state_score, (int, float)) or isinstance(state_score, bool):
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: best_score must be numeric. "
+            "Run ResetExperiments.py first."
+        )
+    if not isinstance(updated_at, str) or not updated_at:
+        raise RuntimeError(
+            f"Invalid best state metadata at {BEST_STATE_PATH}: updated_at is missing. "
+            "Run ResetExperiments.py first."
+        )
+
+    _cleanup_stray_best_branches(target_repo, stray_best_branches)
+    return (best_commit, float(state_score))
+
+
+def _write_best_state(target_repo: Path, best_commit: str, best_score: float, eval_strategy: str) -> None:
+    best_state = {
+        "target_repo": str(target_repo),
+        "best_branch": BEST_BRANCH,
+        "best_commit": best_commit,
+        "best_score": best_score,
+        "eval_strategy": eval_strategy,
+        "updated_at": datetime.now().isoformat(),
+    }
+    temp_path = BEST_STATE_PATH.with_suffix(".tmp")
+    temp_path.write_text(f"{json.dumps(best_state, indent=2)}\n", encoding="utf-8")
+    temp_path.replace(BEST_STATE_PATH)
+
+
+def _promote_best_state(target_repo: Path, best_commit: str, best_score: float, eval_strategy: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(target_repo), "branch", "-f", BEST_BRANCH, best_commit],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _write_best_state(target_repo, best_commit, best_score, eval_strategy)
+    _cleanup_stray_best_branches(target_repo)
+
+
+def _get_head_commit(target_repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(target_repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _resolve_branch_commit(target_repo: Path, branch_name: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(target_repo), "rev-parse", "--verify", f"refs/heads/{branch_name}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _list_branches(target_repo: Path, pattern: str) -> list[str]:
+    output = subprocess.run(
+        ["git", "-C", str(target_repo), "branch", "--format=%(refname:short)", "--list", pattern],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _cleanup_stray_best_branches(target_repo: Path, stray_branches: list[str] | None = None) -> None:
+    branches = stray_branches if stray_branches is not None else [
+        branch for branch in _list_branches(target_repo, "best/*") if branch != BEST_BRANCH
+    ]
+    for branch_name in branches:
+        result = subprocess.run(
+            ["git", "-C", str(target_repo), "branch", "-D", branch_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(f"Deleted stray best branch: {branch_name}")
+        else:
+            stderr = result.stderr.strip() or "unknown error"
+            print(f"Warning: failed to delete stray best branch {branch_name}: {stderr}")
+
+
+def _delete_branches(target_repo: Path, pattern: str) -> None:
+    for name in _list_branches(target_repo, pattern):
+        result = subprocess.run(
+            ["git", "-C", str(target_repo), "branch", "-D", name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(f"Deleted branch: {name}")
+        else:
+            stderr = result.stderr.strip() or "unknown error"
+            print(f"Warning: failed to delete branch {name}: {stderr}")
 
 
 def _create_worktree(target_repo: Path, worktree_path: Path, commit: str):
@@ -353,14 +524,18 @@ def _create_worktree(target_repo: Path, worktree_path: Path, commit: str):
     )
     subprocess.run(
         ["git", "-C", str(target_repo), "worktree", "add", "--detach", str(worktree_path), commit],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
 
 def _sync_eval_worktree(eval_worktree: Path, commit_hash: str) -> None:
     subprocess.run(
         ["git", "-C", str(eval_worktree), "checkout", commit_hash, "--", "."],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
 
@@ -384,8 +559,12 @@ def _run_eval(eval_command: str, eval_worktree: Path) -> tuple[str, str]:
     command = command.replace("{eval_worktree}", str(eval_worktree))
     try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=300, cwd=str(eval_worktree),
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(eval_worktree),
         )
         if result.returncode == 0:
             return result.stdout.strip(), ""
@@ -396,12 +575,12 @@ def _run_eval(eval_command: str, eval_worktree: Path) -> tuple[str, str]:
         return "", str(exc)
 
 
-def _write_header(log_path: Path, target_repo: Path, base_commit: str, eval_command: str, num_iterations: int, eval_strategy: str):
+def _write_header(log_path: Path, target_repo: Path, initial_commit: str, eval_command: str, num_iterations: int, eval_strategy: str):
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("# Experiment Log\n\n")
         f.write(f"- **Started**: {datetime.now().isoformat()}\n")
         f.write(f"- **Target Repo**: `{target_repo}`\n")
-        f.write(f"- **Base Commit**: `{base_commit}`\n")
+        f.write(f"- **Initial Commit**: `{initial_commit}`\n")
         f.write(f"- **Iterations**: {num_iterations}\n")
         f.write(f"- **Eval Strategy**: {eval_strategy}\n")
         f.write(f"- **Eval Command**: `{eval_command}`\n\n")
@@ -411,7 +590,9 @@ def _append_iteration(log_path: Path, result: dict):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"## Iteration {result['iteration']}\n\n")
         f.write(f"- **Status**: {result['status']}\n")
+        f.write(f"- **Base Commit**: `{result['base_commit']}`\n")
         f.write(f"- **Eval Score**: {result['eval_score']}\n")
+        f.write(f"- **Promoted To {BEST_BRANCH}**: {'yes' if result['promoted_to_best'] else 'no'}\n")
         if result["codex_duration_s"]:
             f.write(f"- **Codex Duration**: {result['codex_duration_s']}s\n")
         f.write(f"- **Worktree**: `{result['worktree']}`\n")
@@ -424,7 +605,7 @@ def _append_iteration(log_path: Path, result: dict):
         f.write("\n---\n\n")
 
 
-def _append_summary(log_path: Path, results: list[dict], best_result: dict | None = None):
+def _append_summary(log_path: Path, results: list[dict], best_result: dict | None = None, fatal_error: str = ""):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write("## Summary\n\n")
         f.write("| Iteration | Status | Eval Score | Duration |\n")
@@ -433,4 +614,6 @@ def _append_summary(log_path: Path, results: list[dict], best_result: dict | Non
             f.write(f"| {r['iteration']} | {r['status']} | {r['eval_score']} | {r['codex_duration_s']}s |\n")
         if best_result:
             f.write(f"\n- **Best Iteration**: {best_result['iteration']} (score: {best_result.get('parsed_score', 'N/A')})\n")
+        if fatal_error:
+            f.write(f"- **Stopped Early**: {fatal_error}\n")
         f.write(f"\n- **Completed**: {datetime.now().isoformat()}\n")

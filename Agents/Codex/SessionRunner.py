@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -36,6 +37,41 @@ def _load_instructions(role: str | None) -> str:
     return "\n\n".join(parts)
 
 
+def _build_session_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
+    session_environment = dict(os.environ)
+    active_virtual_env = session_environment.get("VIRTUAL_ENV", "")
+
+    if active_virtual_env:
+        active_virtual_env_path = Path(active_virtual_env).resolve()
+        filtered_path_entries: list[str] = []
+        for raw_entry in session_environment.get("PATH", "").split(os.pathsep):
+            if not raw_entry:
+                continue
+            try:
+                entry_path = Path(raw_entry).resolve()
+            except OSError:
+                filtered_path_entries.append(raw_entry)
+                continue
+
+            try:
+                is_inside_active_env = entry_path.is_relative_to(active_virtual_env_path)
+            except AttributeError:
+                is_inside_active_env = str(entry_path).startswith(str(active_virtual_env_path))
+
+            if not is_inside_active_env:
+                filtered_path_entries.append(raw_entry)
+
+        session_environment["PATH"] = os.pathsep.join(filtered_path_entries)
+
+    if environment:
+        session_environment.update(environment)
+
+    for key in ("VIRTUAL_ENV", "PYTHONHOME", "__PYVENV_LAUNCHER__"):
+        session_environment.pop(key, None)
+
+    return session_environment
+
+
 def run_codex_session(
     cwd: Path,
     instruction: str,
@@ -49,11 +85,12 @@ def run_codex_session(
 ) -> CodexSessionRunResult:
     preamble = _load_instructions(role)
     full_instruction = f"{preamble}\n\n{instruction}" if preamble else instruction
+    session_environment = _build_session_environment(environment)
 
     agent = CodexAgent(
         codex_executable=codex_executable,
         logs_root=logs_root,
-        environment=environment,
+        environment=session_environment,
         tool_handler=tool_handler,
     )
     try:
