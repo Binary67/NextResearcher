@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tomllib
 from pathlib import Path
 
+from Orchestrator.BestState import BEST_STATE_PATH
+from Orchestrator.Workspace import delete_branches, prune_worktrees
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "CodexConfig.toml"
-BEST_STATE_PATH = PROJECT_ROOT / "BestState.json"
 
 config = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 TARGET_REPO = config["Experiment"]["target_repo"]
@@ -45,32 +46,12 @@ def reset_experiments(target_repo: str | Path | None = None):
 
     if target_repo:
         target = Path(target_repo).resolve()
-        subprocess.run(
-            ["git", "-C", str(target), "worktree", "prune", "--verbose"],
-            check=True,
-        )
+        prune_worktrees(target, verbose=True)
         print(f"Pruned stale worktree refs in {target}")
 
         deleted_branches: list[str] = []
         for pattern in ("experiment/iter_*", "best/*"):
-            branch_output = subprocess.run(
-                ["git", "-C", str(target), "branch", "--format=%(refname:short)", "--list", pattern],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-            for name in [line.strip() for line in branch_output.splitlines() if line.strip()]:
-                delete_result = subprocess.run(
-                    ["git", "-C", str(target), "branch", "-D", name],
-                    capture_output=True,
-                    text=True,
-                )
-                if delete_result.returncode == 0:
-                    deleted_branches.append(name)
-                    print(f"  Deleted branch: {name}")
-                else:
-                    stderr = delete_result.stderr.strip() or "unknown error"
-                    print(f"  Warning: failed to delete branch {name}: {stderr}")
+            deleted_branches.extend(delete_branches(target, pattern))
 
         branch_count = len(deleted_branches)
         if branch_count:
